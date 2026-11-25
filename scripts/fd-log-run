@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# A Bash exec boundary works identically when invoked by Bash, Fish, or Nushell.
+# A Bash exec boundary works identically from Bash, Zsh, Fish, or Nushell.
 set -euo pipefail
 if (( $# < 3 )) || [[ $2 != -- ]]; then
     printf 'Usage: fd-log-run DIRECTORY -- COMMAND [ARG ...]\n' >&2

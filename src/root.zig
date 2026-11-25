@@ -15,7 +15,7 @@ pub const Routes = struct {
 var routes: Routes = .{};
 var mutex: std.Io.Mutex = .init;
 
-/// Configure once, before concurrent logging. Null routes use std.log.defaultLog.
+/// Configure before concurrent logging. Null routes use std.log.defaultLog.
 /// Requires writable, blocking POSIX descriptors. No ownership is transferred.
 /// Invalid routes leave the previous configuration unchanged.
 pub fn configure(new_routes: Routes) error{InvalidDescriptor}!void {

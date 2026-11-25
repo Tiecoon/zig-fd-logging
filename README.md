@@ -1,8 +1,8 @@
 # zig-fd-logging
 
-A small POSIX file-descriptor sink for **Zig 0.17.1** (latest stable). No Zig
-package dependencies. Nix is optional; `flake.lock` pins nixpkgs and Zig for
-reproducible development and builds.
+A small POSIX file-descriptor sink targeting **Zig 0.17.1**. No Zig package
+dependencies. Nix is optional; `flake.lock` pins nixpkgs and Zig for reproducible
+development and builds.
 
 | `std.log` level | Inherited FD | Helper output |
 | --- | ---: | --- |
@@ -12,12 +12,24 @@ reproducible development and builds.
 | `.debug` | 6 | `debug.log` |
 
 stdin/stdout/stderr stay untouched. Panics, stack traces, and direct writes to
-stderr are not logging calls and are not rerouted.
+stderr are not logging calls and are not rerouted. **The application must install
+this Zig logging hook.** The shell helpers cannot split an arbitrary program's
+stderr into log levels.
 
 ## Import into another Zig project
 
-Add a local dependency to your application's `build.zig.zon` (or use
-`zig fetch --save=fd_log URL` once this package is hosted):
+From your application's directory (the one containing `build.zig.zon`), fetch
+the current `main` branch:
+
+```sh
+zig fetch --save=fd_log 'git+https://github.com/Tiecoon/zig-fd-logging.git#main'
+```
+
+Zig resolves `main` to a commit and saves the resolved URL and content hash in
+`build.zig.zon`. Later builds use that pinned dependency; they do not silently
+follow new commits. Run the same fetch command again when you want to update.
+Commit `build.zig.zon` with your application so other machines use the same
+revision. To work on a local copy instead, merge this into `.dependencies`:
 
 ```zig
 .dependencies = .{
@@ -64,6 +76,10 @@ For custom or partial routing, use `configure` instead:
 try fd_log.configure(.{ .warn = 9, .debug = 10 });
 ```
 
+The caller must open those descriptors before starting the application. For the
+custom mapping above, a Bash launch could be `./my-app 9>>warn.log 10>>debug.log`;
+no `ZIG_LOG_FDS` marker is needed when calling `configure` directly.
+
 Null routes use stderr. Configure before concurrent logging. Descriptors are
 borrowed and must remain open, writable, and blocking. Invalid configuration
 returns `error.InvalidDescriptor` without changing the previous routes. Logging
@@ -75,6 +91,7 @@ before initialization uses stderr. Do not close or repurpose configured FDs.
 nix develop
 zig build
 ./scripts/fd-log-run './logs with spaces' -- ./zig-out/bin/fd-log-example
+cat './logs with spaces/info.log'
 zig build test
 ```
 
@@ -93,30 +110,51 @@ ZIG_LOG_FDS=1 ./zig-out/bin/fd-log-example \
 
 ## Nix / Home Manager
 
-Add this flake as an input (use a hosted URL once published):
+Add this flake as an input:
 
 ```nix
-inputs.fd-log.url = "path:/home/luke/projects/zig-fd-logging";
+inputs.fd-log.url = "github:Tiecoon/zig-fd-logging";
 inputs.fd-log.inputs.nixpkgs.follows = "nixpkgs";
 ```
 
-Then import its module in your Home Manager configuration, with `inputs` in scope:
+Then add `inputs.fd-log.homeManagerModules.default` to your Home Manager
+`imports` or `modules` list. For example, if your configuration passes `inputs`
+through Home Manager's `extraSpecialArgs`, a home module can contain:
 
 ```nix
-imports = [inputs.fd-log.homeManagerModules.default];
+{ inputs, ... }: {
+  imports = [inputs.fd-log.homeManagerModules.default];
+}
 ```
+
+This is a **Home Manager module**, not a top-level NixOS or nix-darwin module.
+Enable whichever shells you use with their Home Manager `programs.<shell>.enable`
+options, rebuild/activate your normal configuration, and open a new shell.
+No manual `source` step is needed with this module.
 
 The module installs `packages.<system>.helpers` and sources the matching config
 for each **already-enabled** shell: Bash, Zsh, Fish, and Nushell. It does not
 enable shells, change your login shell, or replace your existing config. The
 helpers package does not compile or depend on Zig. It installs the scripts and
 configs under immutable store paths; no checkout is needed at shell startup.
-Rex still comes from your existing installation.
+Rex still comes from your existing installation. If you do not use Nix, the
+scripts require Bash and standard tools such as `mkdir`, `touch`, and `tail`
+on PATH; the pane helper additionally requires its chosen multiplexer.
 
-A local path input must exist wherever you update or rebuild the Nix config;
-replace it with a hosted URL before using the config on other machines. Changes
-to this project require `nix flake update fd-log` in the consuming config before
-rebuilding. This does not activate anything by itself.
+The Nix package outputs are:
+
+- `nix build` — example executable plus helpers in `result/bin`.
+- `nix build .#helpers` — scripts and shell configs only; no Zig dependency.
+- `nix build .#example` — compiled example executable only.
+
+The helpers package installs `config.sh`, `config.fish`, and `config.nu` under
+`result/share/fd-log/`. Without Home Manager, put `result/bin` on PATH and source
+the matching file, or use the checkout-based setup below.
+
+The consuming config's lock file pins a GitHub revision, so no local checkout
+is needed on any machine. After new commits are pushed, run
+`nix flake update fd-log` in the consuming config before rebuilding.
+This does not activate anything by itself.
 
 ## Shell config examples
 
@@ -166,7 +204,7 @@ help log files
 ```
 
 Arguments, pipes, and stdout/stderr redirections work as they normally do in
-that shell. For example, `log-files my-app | less` (Bash/Fish) or
+that shell. For example, `log-files my-app | less` (Bash/Zsh/Fish) or
 `log files my-app | complete` (Nu) captures application output, while per-level
 logs still go to their separate files. These shortcuts run external programs,
 not shell builtins, aliases, or Nushell custom commands.

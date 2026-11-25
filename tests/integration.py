@@ -144,7 +144,7 @@ class Routing(unittest.TestCase):
             ("fish", "config.fish", "log-files"),
             ("nu", "config.nu", "log files"),
         ):
-            # Nu uses literal JSON-style strings; Bash and Fish use shell quoting.
+            # Nu uses literal JSON-style strings; Bash, Zsh, and Fish use shell quoting.
             quoted = (" ".join(map(json.dumps, command)) if shell == "nu"
                       else shlex.join(command))
             commands[shell] = [shell, "-c",
