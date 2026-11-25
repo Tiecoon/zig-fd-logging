@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+set -euo pipefail
+if (( $# < 4 )) || [[ $3 != -- ]] || [[ $1 != tmux && $1 != rex ]]; then
+    printf 'Usage: fd-log-panes {tmux|rex} DIRECTORY -- COMMAND [ARG ...]\n' >&2
+    exit 2
+fi
+backend=$1
+directory=$2
+shift 3
+command -v "$backend" >/dev/null
+if [[ $backend == tmux && -z ${TMUX:-} ]]; then
+    printf 'Run the tmux helper inside a tmux session.\n' >&2
+    exit 2
+fi
+if [[ $backend == rex && -z ${REX_BLOCK:-} ]]; then
+    printf 'Run the Rex helper inside a Rex pane (REX_BLOCK must be set).\n' >&2
+    exit 2
+fi
+mkdir -p -- "$directory"
+directory=$(cd -- "$directory" && pwd -P)
+for level in err warn info debug; do
+    touch -- "$directory/$level.log"
+    if [[ $backend == tmux ]]; then
+        # tmux takes a shell command, so quote every argument for a known shell.
+        printf -v watch '%q ' tail -n 20 -F -- "$directory/$level.log"
+        printf -v pane_command 'bash -c %q' "exec $watch"
+        tmux split-window -d -v "$pane_command"
+        tmux select-layout tiled >/dev/null
+    else
+        rex split -b "$REX_BLOCK" --split=below --ratio 20 --focus=false \
+            --label "log:$level" --shell=none -- \
+            tail -n 20 -F -- "$directory/$level.log" >/dev/null
+    fi
+done
+# Logs are durable regular files, not FIFOs: closing a pane cannot SIGPIPE or
+# block the application. Tailers remain available until the user closes them.
+script_directory=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+exec "$script_directory/fd-log-run" "$directory" -- "$@"

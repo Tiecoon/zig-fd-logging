@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# A Bash exec boundary works identically when invoked by Bash, Fish, or Nushell.
+set -euo pipefail
+if (( $# < 3 )) || [[ $2 != -- ]]; then
+    printf 'Usage: fd-log-run DIRECTORY -- COMMAND [ARG ...]\n' >&2
+    exit 2
+fi
+directory=$1
+shift 2
+mkdir -p -- "$directory"
+# Append rather than truncate: tailers stay attached and previous runs survive.
+# Redirections belong on exec, not on the calling shell (Nu cannot express them).
+export ZIG_LOG_FDS=1
+exec "$@" 3>>"$directory/err.log" 4>>"$directory/warn.log" \
+    5>>"$directory/info.log" 6>>"$directory/debug.log"
