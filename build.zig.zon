@@ -3,5 +3,5 @@
     .version = "0.1.0",
     .fingerprint = 0xd18094bb9bbf18bf,
     .minimum_zig_version = "0.17.1",
-    .paths = .{ "build.zig", "build.zig.zon", "src", "examples", "scripts", "tests", "README.md", "flake.nix", "flake.lock" },
+    .paths = .{ "build.zig", "build.zig.zon", "src", "python", "examples", "scripts", "tests", "README.md", "flake.nix", "flake.lock" },
 }

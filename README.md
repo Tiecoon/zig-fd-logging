@@ -1,43 +1,27 @@
 # zig-fd-logging
 
-A small POSIX file-descriptor sink targeting **Zig 0.17.1**. No Zig package
-dependencies. Nix is optional; `flake.lock` pins nixpkgs and Zig for reproducible
-development and builds.
+A small, optional transport for **Zig 0.17.1 `std.log`** and **Python 3.10+
+`logging`**, sharing one Zig collector. No third-party runtime dependencies.
 
-| `std.log` level | Inherited FD | Helper output |
-| --- | ---: | --- |
-| `.err` | 3 | `err.log` |
-| `.warn` | 4 | `warn.log` |
-| `.info` | 5 | `info.log` |
-| `.debug` | 6 | `debug.log` |
+**Without a collector, logging uses the standard stderr behavior.** With the
+collector, log records travel over one extra inherited pipe and are separated
+into files automatically. stdin, stdout, and stderr are inherited unchanged;
+explicit writes to stderr, panics, and stack traces are never rerouted.
 
-stdin/stdout/stderr stay untouched. Panics, stack traces, and direct writes to
-stderr are not logging calls and are not rerouted. **The application must install
-this Zig logging hook.** The shell helpers cannot split an arbitrary program's
-stderr into log levels.
+## Import into a Zig project
 
-## Import into another Zig project
-
-From your application's directory (the one containing `build.zig.zon`), fetch
-the current `main` branch:
+Fetch the current `main` branch from your application's directory:
 
 ```sh
 zig fetch --save=fd_log 'git+https://github.com/Tiecoon/zig-fd-logging.git#main'
 ```
 
-Zig resolves `main` to a commit and saves the resolved URL and content hash in
-`build.zig.zon`. Later builds use that pinned dependency; they do not silently
-follow new commits. Run the same fetch command again when you want to update.
-Commit `build.zig.zon` with your application so other machines use the same
-revision. To work on a local copy instead, merge this into `.dependencies`:
+Zig saves a resolved commit and content hash in `build.zig.zon`; builds do not
+silently follow new commits. Repeat the fetch command to update, and commit the
+resulting dependency pin. For local development, use
+`.fd_log = .{ .path = "../zig-fd-logging" }` in `.dependencies` instead.
 
-```zig
-.dependencies = .{
-    .fd_log = .{ .path = "../zig-fd-logging" },
-},
-```
-
-In its `build.zig`, after creating the executable:
+After creating your executable in `build.zig`:
 
 ```zig
 const fd_log = b.dependency("fd_log", .{ .target = target, .optimize = optimize });
@@ -52,74 +36,216 @@ const fd_log = @import("fd_log");
 
 pub const std_options: std.Options = .{
     .logFn = fd_log.logFn,
-    .log_level = .debug, // Optional; otherwise std.log's build-mode default applies.
+    .log_level = .debug, // Optional; std.log's normal build-mode default otherwise.
 };
 
 pub fn main(init: std.process.Init) !void {
-    try fd_log.configureFromEnvironment(init.environ_map);
+    fd_log.configureFromEnvironment(init.environ_map);
     std.log.info("listening on port {d}", .{8080});
     std.log.scoped(.network).warn("retrying", .{});
 }
 ```
 
-Library code keeps calling ordinary `std.log`. All levels, scoped loggers,
-compile-time filtering, and argument formatting stay upstream. The sink calls
-`std.log.defaultLogFileTerminal` rather than copying its formatter. Unrouted
-messages call `std.log.defaultLog`, including its standard color behavior.
-There is no parallel logging API or compatibility shim.
+Initialize once, before starting threads. Libraries keep calling `std.log` as
+usual. Levels, scopes, filtering, and argument formatting stay upstream; the
+hook calls `std.log.defaultLogFileTerminal` rather than copying its formatter.
+Importing the module does not require building or running the collector.
 
-Without `ZIG_LOG_FDS=1`, `configureFromEnvironment` keeps logging to stderr,
-even if other FDs happen to exist. With it, all four reserved FDs must be valid.
-For custom or partial routing, use `configure` instead:
+Without the collector's `ZIG_LOG_FD` marker, the hook calls
+`std.log.defaultLog` directly, preserving its stderr/color behavior without
+allocations, a scope registry, or an extra lock. Missing, stale, and invalid
+markers also fall back to standard logging. Logging before initialization is
+standard logging too.
 
-```zig
-try fd_log.configure(.{ .warn = 9, .debug = 10 });
+## Python client (3.10+)
+
+Install into your project's Python environment; no Python collector or runtime
+packages are needed:
+
+```sh
+python3 -m pip install ./python
 ```
 
-The caller must open those descriptors before starting the application. For the
-custom mapping above, a Bash launch could be `./my-app 9>>warn.log 10>>debug.log`;
-no `ZIG_LOG_FDS` marker is needed when calling `configure` directly.
+Use a normal logging handler, with your usual format, levels, and filters:
 
-Null routes use stderr. Configure before concurrent logging. Descriptors are
-borrowed and must remain open, writable, and blocking. Invalid configuration
-returns `error.InvalidDescriptor` without changing the previous routes. Logging
-before initialization uses stderr. Do not close or repurpose configured FDs.
+```python
+import logging
+from zig_fd_logging import Handler
+
+logging.basicConfig(handlers=[Handler()], level=logging.INFO)
+logging.info("listening on port %d", 8080)
+logging.getLogger("network").warning("retrying")
+```
+
+Without the collector, `Handler` delegates to `logging.StreamHandler`, including
+its standard stderr, formatting, filtering, and exception behavior. An optional
+`stream=` argument selects its normal fallback stream, just like StreamHandler.
+Installing the handler follows normal logging configuration rules; use
+`force=True` with `basicConfig` only if you intend to replace existing handlers.
+
+With the collector, Python root logs use the severity files and named loggers
+use the same `scope-NAME.log` convention as Zig. Logger names need no registration
+and can be created at runtime. CRITICAL and ERROR route to `err`, WARNING to
+`warn`, INFO to `info`, and lower custom levels to `debug`. The configured Python
+formatter and terminator are preserved; Unicode is transported as UTF-8.
+
+After installation, use the same collector or pane helpers:
+
+```sh
+./zig-out/bin/fd-log-run ./python-logs -- python3 examples/python_logging.py
+fd-log-panes tmux ./python-logs -- python3 examples/python_logging.py
+fd-log-panes rex ./python-logs -- python3 examples/python_logging.py
+```
+
+For a source checkout without installation, add the repository's `python/`
+directory to `PYTHONPATH`. Nix users can add the `packages.<system>.python`
+package to `pkgs.python3.withPackages`; it is deliberately not installed globally
+by the shell-helper module. Python 3.10 is runtime-tested, not only declared in
+package metadata.
 
 ## Build and run
 
 ```sh
 nix develop
 zig build
-./scripts/fd-log-run './logs with spaces' -- ./zig-out/bin/fd-log-example
-cat './logs with spaces/info.log'
+
+# No collector: standard logging to stderr.
+./zig-out/bin/fd-log-example
+
+# Optional collector: discover streams and append to their files.
+./zig-out/bin/fd-log-run './logs with spaces' -- ./zig-out/bin/fd-log-example
+cat './logs with spaces/scope-network.log'
+
+# Include additional scopes and a multiline message.
+./zig-out/bin/fd-log-run ./logs -- ./zig-out/bin/fd-log-example --scopes
+
 zig build test
 ```
 
-The helper works unchanged from **Bash, Zsh, Fish, and Nushell**; Nu can prefix the
-command with `^`. It opens append-only files, sets `ZIG_LOG_FDS=1`, and execs the
-application, preserving arguments and exit/signal behavior. Use the **built
-binary**, not `zig build run`: intermediate tools may close or repurpose FDs.
+Nix is optional; `flake.lock` pins nixpkgs and Zig for reproducible builds.
+Without Nix, install Zig 0.17.1 and run `zig build`. Python and the four shells
+are needed for integration tests, not for the logging library or collector.
 
-Bash and current Fish support direct numeric-FD redirection too; Nushell does
-not interpret `3>file` that way. For example, in Bash:
+The collector works from Bash, Zsh, Fish, and Nushell. Use the built application
+binary, not an intermediate build runner that may close inherited descriptors.
+The application must install this logging hook; arbitrary programs still run
+normally but their stderr cannot be separated into scopes.
 
-```bash
-ZIG_LOG_FDS=1 ./zig-out/bin/fd-log-example \
-  3>>err.log 4>>warn.log 5>>info.log 6>>debug.log
+### Automatic outputs
+
+No scope list or discovery command is required. The first emitted record for a
+stream creates its file:
+
+| Logging call | File |
+| --- | --- |
+| `std.log.err(...)` | `err.log` |
+| `std.log.warn(...)` | `warn.log` |
+| `std.log.info(...)` | `info.log` |
+| `std.log.debug(...)` | `debug.log` |
+| `std.log.scoped(.network).info(...)` | `scope-network.log` |
+| `std.log.scoped(.network).err(...)` | the same `scope-network.log` |
+| `std.log.scoped(.database).debug(...)` | `scope-database.log` |
+
+Named scopes combine all their emitted severities. Default-scope logs remain
+separated by severity. Only emitted streams appear; standard compile-time
+filtering still applies. Names are compile-time Zig scope names, not a new
+logging API. There is no fixed stream count, apart from OS resource limits.
+
+The `scope-` prefix avoids collisions with severity names. Each scope-name byte
+outside ASCII letters, digits, `-`, and `_` becomes `%HH`, so quotes, slashes,
+Unicode, and other characters cannot turn a name into a filesystem path.
+Filesystem filename-length limits still apply. Log files contain formatted
+messages, including multiline messages—not transport metadata. The clients do
+not add terminal colors; explicitly supplied escapes or custom formatter output
+are preserved. Files append across runs; choose another directory for a fresh run.
+
+## Shell configuration
+
+The Nix module below installs and sources these functions automatically.
+Without Nix, add both the built binaries and scripts to PATH, then source the
+matching configuration from the project root:
+
+**Bash / Zsh** (`~/.bashrc` or `~/.zshrc`):
+
+```sh
+export PATH="$PWD/zig-out/bin:$PWD/scripts:$PATH"
+source examples/shell/config.sh
+log-files ./zig-out/bin/fd-log-example
+log-rex ./zig-out/bin/fd-log-example
+log-tmux ./zig-out/bin/fd-log-example
 ```
+
+**Fish** (`~/.config/fish/config.fish`):
+
+```fish
+set -gx PATH "$PWD/zig-out/bin" "$PWD/scripts" $PATH
+source examples/shell/config.fish
+log-files ./zig-out/bin/fd-log-example
+log-rex ./zig-out/bin/fd-log-example
+```
+
+**Nushell** (`$nu.config-path`):
+
+```nu
+$env.PATH = ($env.PATH | prepend [($env.PWD | path join zig-out bin) ($env.PWD | path join scripts)])
+source examples/shell/config.nu
+log files ./zig-out/bin/fd-log-example
+log rex ./zig-out/bin/fd-log-example
+log tmux ./zig-out/bin/fd-log-example
+```
+
+Use absolute paths for permanent configurations. Shortcuts append to
+`FD_LOG_DIR` (defaulting to `./logs` in the working directory) and pass
+arguments literally. They launch external programs, not shell builtins or
+aliases. Application stdout/stderr redirections and pipelines work normally,
+such as `log-files my-app | less` or `log files my-app | complete` in Nu.
+
+### Rex / tmux viewers
+
+Run the pane shortcut inside the corresponding multiplexer, or specify a log
+directory explicitly:
+
+```sh
+fd-log-panes rex './logs with spaces' -- ./zig-out/bin/fd-log-example
+fd-log-panes tmux ./logs -- ./zig-out/bin/fd-log-example
+```
+
+The application stays in the calling pane. Viewers appear as streams are
+emitted, following regular files with `tail -n 20 -F`. They remain open when the
+application exits. Closing a viewer does not break the logging pipe or block
+the application.
+
+Repeated runs from the same calling pane and log directory reuse surviving
+viewers, creating replacements only for missing viewers. Pane bookkeeping stays
+in the log directory; use a different directory to keep two runs separate.
+Rex keeps the caller on the left with equal-height log viewers on the right,
+without changing unrelated panes. Rex keeps severity colors reserved and assigns
+new scopes the most widely spaced available hues, with muted dark backgrounds
+and high-contrast text. Surviving viewers retain their colors across runs. With
+very many streams, colors necessarily become less distinguishable; pane labels
+remain authoritative. Colors stay in the shell, not the files or logging clients.
+tmux uses the same local left/right arrangement,
+with equal-height viewers, leaving unrelated panes alone.
+Very many streams can exceed the available terminal space or multiplexer limits;
+use file-only collection in that case.
+
+Rex must already be installed and connected, with `REX_BLOCK` set and support
+for embedded `rex do`, nested splits, and pane resizing. tmux needs `TMUX` and
+sufficient room. The shell integration needs Bash and standard tools on PATH.
+No external Lua or JSON parser is required for Rex.
 
 ## Nix / Home Manager
 
-Add this flake as an input:
+Add this input to your configuration:
 
 ```nix
 inputs.fd-log.url = "github:Tiecoon/zig-fd-logging";
 inputs.fd-log.inputs.nixpkgs.follows = "nixpkgs";
 ```
 
-Then add `inputs.fd-log.homeManagerModules.default` to your Home Manager
-`imports` or `modules` list. For example, if your configuration passes `inputs`
-through Home Manager's `extraSpecialArgs`, a home module can contain:
+Import `inputs.fd-log.homeManagerModules.default` into **Home Manager**, not a
+top-level NixOS/nix-darwin module. If your home modules receive `inputs` through
+`extraSpecialArgs`:
 
 ```nix
 { inputs, ... }: {
@@ -127,133 +253,78 @@ through Home Manager's `extraSpecialArgs`, a home module can contain:
 }
 ```
 
-This is a **Home Manager module**, not a top-level NixOS or nix-darwin module.
-Enable whichever shells you use with their Home Manager `programs.<shell>.enable`
-options, rebuild/activate your normal configuration, and open a new shell.
-No manual `source` step is needed with this module.
+It installs the collector and shell helpers, sourcing config for each
+already-enabled Bash, Zsh, Fish, and Nushell. It does not enable shells or
+replace your config. Rebuild/activate normally and open a new shell; no manual
+sourcing or local checkout is needed. Rex comes from your existing installation.
+Zig is a build dependency, not a runtime dependency.
 
-The module installs `packages.<system>.helpers` and sources the matching config
-for each **already-enabled** shell: Bash, Zsh, Fish, and Nushell. It does not
-enable shells, change your login shell, or replace your existing config. The
-helpers package does not compile or depend on Zig. It installs the scripts and
-configs under immutable store paths; no checkout is needed at shell startup.
-Rex still comes from your existing installation. If you do not use Nix, the
-scripts require Bash and standard tools such as `mkdir`, `touch`, and `tail`
-on PATH; the pane helper additionally requires its chosen multiplexer.
+- `nix build` — collector, example, shell helpers, and shell configs.
+- `nix build .#collector` — collector only.
+- `nix build .#helpers` — collector plus shell helpers/configs, without the example.
+- `nix build .#example` — example only.
+- `nix build .#python` — installable Python handler package.
 
-The Nix package outputs are:
+Configs are installed in `share/fd-log/config.{sh,fish,nu}`. The consuming
+configuration pins a GitHub revision. After publishing an update, run
+`nix flake update fd-log` there before rebuilding; this does not activate anything
+by itself. No changes to `/etc/nixos` are needed for the new module interface.
 
-- `nix build` — example executable plus helpers in `result/bin`.
-- `nix build .#helpers` — scripts and shell configs only; no Zig dependency.
-- `nix build .#example` — compiled example executable only.
+## Transport and failure behavior
 
-The helpers package installs `config.sh`, `config.fish`, and `config.nu` under
-`result/share/fd-log/`. Without Home Manager, put `result/bin` on PATH and source
-the matching file, or use the checkout-based setup below.
+The launcher opens one blocking pipe, passes its writable descriptor through
+`ZIG_LOG_FD`, and spawns the application with inherited standard streams. While
+the application runs, the launcher ignores `SIGINT`/`SIGQUIT` and forwards
+`SIGTERM` to the child so graceful shutdown logs drain cleanly before exit. It
+returns the application's exit code (128 + signal number for signal exits), or
+fails if collection fails. It waits for application completion and drains logs.
+Other caller-opened inheritable FDs also reach the application unchanged: for
+example, `fd-log-run ./logs -- my-app 7>extra.log` lets the application write to
+FD 7 normally. This does not assign collected log streams to that descriptor;
+the collector's discovered log outputs are files.
 
-The consuming config's lock file pins a GitHub revision, so no local checkout
-is needed on any machine. After new commits are pushed, run
-`nix flake update fd-log` in the consuming config before rebuilding.
-This does not activate anything by itself.
+Records have a length-prefixed binary header containing severity, scope length,
+and message length. Newlines and binary bytes cannot split or forge records.
+A mutex serializes records from threads within one application. Typical records
+use stack storage; long collected messages may allocate. No application-side
+registration, worker thread, background service, or runtime dependency is needed.
 
-## Shell config examples
+If writing to the collector fails, the hook switches to standard stderr logging,
+including retrying the current message. Data already accepted into the pipe may
+be lost if the collector dies; a partially delivered record may be incomplete.
+Slow collectors apply backpressure. These are best-effort logs, not a durable
+message queue. The normal Zig process runtime handles SIGPIPE; an application
+that overrides that signal policy is responsible for preserving it.
 
-Without Home Manager, source the matching example from the project root, or
-copy its functions into `~/.bashrc`, `~/.zshrc`,
-`~/.config/fish/config.fish`, or Nushell's `$nu.config-path`.
-For a permanent setup, add the absolute `scripts/` path to your shell's PATH
-(or use the helpers installed by Nix).
+The inherited descriptor is borrowed: do not close, reuse, or write to it
+outside this hook. Initialization marks it close-on-exec, so unrelated children
+do not keep collection alive. Multiple processes must not share one logging
+pipe; launch each participating executable with its own collector. Descendants
+that intentionally retain the write end can delay EOF. Concurrent collectors
+should use separate log directories when pane bookkeeping matters.
 
-**Bash / Zsh:**
+The collector optionally accepts `--on-stream SCRIPT`, executing
+`SCRIPT DIRECTORY STREAM` once per discovered output per run, after writing its
+first record. Arguments are not shell-evaluated, and hooks run with `/dev/null`
+stdin/stdout so they cannot interfere with the application's pipelines. The
+supplied pane helper uses this interface; the collector knows nothing about Rex
+or tmux. Hook failures fail collection, close the pipe to enable application
+stderr fallback, and wait for the application rather than killing it.
 
-```sh
-export PATH="$PWD/scripts:$PATH"
-source examples/shell/config.sh
-```
+## Verification
 
-**Fish:**
+`zig build test` exercises both Zig and Python clients through real processes:
+standard stderr fallback, unchanged stdin/stdout/stderr and extra inherited FDs,
+automatic scope/severity separation, name escaping, filtering, Python formatters
+and exceptions, long/multiline/concurrent records, append behavior, broken
+collectors, fragmented/truncated transport, hook arguments, and exit status.
+Shell integration covers Bash, Zsh, Fish, and Nushell. Run
+`python3 tests/panes.py` for separate real Rex/tmux reuse and replacement checks.
+To exercise a specific Python version, run
+`python3.10 tests/python_client.py zig-out/bin/fd-log-run`.
 
-```fish
-set -gx PATH "$PWD/scripts" $PATH
-source examples/shell/config.fish
-```
-
-**Nushell:**
-
-```nu
-$env.PATH = ($env.PATH | prepend ($env.PWD | path join scripts))
-source examples/shell/config.nu
-```
-
-The shortcuts are command-first and always append to `./logs` in the current
-directory. **Bash / Zsh / Fish:**
-
-```sh
-log-files ./zig-out/bin/fd-log-example --long
-log-tmux ./zig-out/bin/fd-log-example
-log-rex ./zig-out/bin/fd-log-example
-```
-
-**Nushell** uses native subcommands with typed rest arguments and help:
-
-```nu
-log files ./zig-out/bin/fd-log-example --long
-log tmux ./zig-out/bin/fd-log-example
-log rex ./zig-out/bin/fd-log-example
-help log files
-```
-
-Arguments, pipes, and stdout/stderr redirections work as they normally do in
-that shell. For example, `log-files my-app | less` (Bash/Zsh/Fish) or
-`log files my-app | complete` (Nu) captures application output, while per-level
-logs still go to their separate files. These shortcuts run external programs,
-not shell builtins, aliases, or Nushell custom commands.
-
-For a different directory, use `fd-log-run './logs with spaces' -- my-app`
-or `fd-log-panes rex './logs with spaces' -- my-app` directly. The pane commands
-require running inside that multiplexer. The configs contain no FD or pane
-implementation; that stays in `scripts/`.
-
-## Pane helpers
-
-Run inside an existing tmux or Rex pane:
-
-```sh
-./scripts/fd-log-panes tmux ./logs -- ./zig-out/bin/fd-log-example
-./scripts/fd-log-panes rex ./logs -- ./zig-out/bin/fd-log-example
-```
-
-Both create four background viewers and run the application in the original
-pane. tmux requires `TMUX` and enough room; it tiles the current window. Rex
-requires `REX_BLOCK`, anchors to that block, labels each viewer, and preserves
-focus. Rex itself must already be installed and connected.
-
-Viewers run `tail -n 20 -F` on regular files, not FIFOs: closing a pane cannot
-block the application or cause SIGPIPE. They remain open after the application
-exits; stop them with Ctrl-C or close the panes. Files append across runs; use a
-new directory for a fresh run. If pane creation fails, the application does not
-start; any viewers already created remain for manual inspection/closing.
-You can also run `fd-log-run` alone and start your own `tail -F` viewers.
-
-## Contracts and verification
-
-Routed output is uncolored and flushed per message using a buffered streaming
-writer. It is not truncated at the buffer boundary. A mutex prevents routed
-records from this process interleaving, even when routes share a descriptor.
-It does not synchronize other processes or arbitrary direct writes. Slow sinks
-can block; write failures are best effort, as with `std.log`. No fallback retry
-after a partial write. Custom pipes follow the application's SIGPIPE policy.
-Clear the environment marker and close reserved FDs for unrelated children that
-must not inherit the logging convention.
-
-`zig build test` checks real executable behavior under all four shells:
-level separation, unchanged stdout/stderr, scope filtering, fallback and partial
-routing, invalid FDs, append semantics, long/concurrent records, arguments, and
-exit status. `nix flake check` also builds the installed package; `nix build`
-puts the example and both helpers in `result/bin`.
-
-Linux is runtime-tested. Both macOS architectures are cross-compiled, not
-runtime-tested. Nix exposes x86_64/aarch64 Linux and Darwin outputs; Windows
-HANDLE inheritance is out of scope. Update with `nix flake update`, then check
-`zig version`, `zig build test`, and `nix flake check`. Upstream formatter updates
-come with the toolchain; pre-1.0 Zig API changes may still require source edits.
+`nix flake check` builds and tests the packaged collector and helpers. Linux is
+runtime-tested; Darwin cross-compilation is checked separately, not equivalent
+to macOS runtime testing. Nix exposes x86_64/aarch64 Linux and Darwin outputs.
+Windows HANDLE inheritance is out of scope. Upstream formatting updates arrive
+with Zig; pre-1.0 API changes may still require source edits.

@@ -1,0 +1,146 @@
+#!/usr/bin/env bash
+# Collector hook: DIRECTORY STREAM. Only discovered streams get viewers.
+set -euo pipefail
+directory=$1
+stream=$2
+if [[ ! $stream =~ ^(err|warn|info|debug|scope-([a-zA-Z0-9_-]|%[0-9A-F]{2})*)$ ]]; then
+    printf 'Invalid log stream: %s\n' "$stream" >&2
+    exit 2
+fi
+if [[ $FD_LOG_BACKEND == tmux ]]; then
+    streams=() panes=() pids=()
+    found=false
+    if [[ -f $FD_LOG_STATE ]]; then
+        while IFS=$'\t' read -r name pane pid; do
+            info=$(tmux display-message -p -t "$pane" '#{pane_dead}:#{pane_pid}:#{@fd-log-path}' 2>/dev/null) || continue
+            IFS=: read -r dead actual_pid actual <<< "$info"
+            [[ $actual == "$directory/$name.log" ]] || continue
+            if [[ $dead == 1 ]]; then
+                tmux kill-pane -t "$pane" 2>/dev/null || true
+                continue
+            fi
+            [[ $actual_pid == "$pid" ]] || continue
+            streams+=("$name") panes+=("$pane") pids+=("$pid")
+            [[ $name != "$stream" ]] || found=true
+        done < "$FD_LOG_STATE"
+    fi
+    if ! "$found"; then
+        # Multiple command arguments bypass tmux's default shell entirely.
+        if (( ${#panes[@]} == 0 )); then
+            created=$(tmux split-window -d -h -t "$FD_LOG_CALLER" -P -F '#{pane_id}:#{pane_pid}' tail -n 20 -F -- "$directory/$stream.log")
+        else
+            created=$(tmux split-window -d -v -t "${panes[-1]}" -P -F '#{pane_id}:#{pane_pid}' tail -n 20 -F -- "$directory/$stream.log")
+        fi
+        IFS=: read -r pane pid <<< "$created"
+        tmux set-option -p -t "$pane" @fd-log-path "$directory/$stream.log"
+        tmux select-pane -t "$pane" -T "log:$stream"
+        streams+=("$stream") panes+=("$pane") pids+=("$pid")
+    fi
+    height=$(tmux display-message -p -t "$FD_LOG_CALLER" '#{pane_height}')
+    for ((i=0; i<${#panes[@]}-1; i++)); do
+        target=$(( (height + 1) / ${#panes[@]} - 1 + (i < (height + 1) % ${#panes[@]}) ))
+        (( target < 1 )) && target=1
+        tmux resize-pane -t "${panes[i]}" -y "$target"
+    done
+    tmp="$FD_LOG_STATE.tmp.$$"
+    : > "$tmp"
+    for ((i=0; i<${#panes[@]}; i++)); do
+        printf '%s\t%s\t%s\n' "${streams[i]}" "${panes[i]}" "${pids[i]}" >> "$tmp"
+    done
+    mv -f -- "$tmp" "$FD_LOG_STATE"
+else
+    # Keep paths as literal data; the embedded Lua owns the layout and state.
+    rex 'do' -b "$FD_LOG_CALLER" - "directory=$directory" "stream=$stream" "state=$FD_LOG_STATE" >/dev/null <<'LUA'
+local args = rex.args
+local view = assert(rex.session.view {})
+local blocks = {}
+for _, window in ipairs(view.windows) do
+    for _, layer in ipairs(window.layers) do
+        for _, block in ipairs(layer.blocks) do blocks[block.block_id] = block end
+    end
+end
+local function process(id)
+    return rex.call("block.method", {session_id = rex.session_id, block_id = id, method = "process"})
+end
+local viewers, found = {}, false
+local saved = io.open(args.state, "r")
+if saved then
+    for line in saved:lines() do
+        local stream, id, pid, hue = line:match("^([^\t]+)\t([^\t]+)\t(%d+)\t([^\t]+)$")
+        if id and blocks[id] and blocks[id].label == "log:" .. stream then
+            local p = process(id)
+            if p and not p.last_exit and p.child and tostring(p.child.pid) == pid
+                and (p.child.argv0 == "tail" or p.child.argv0 == "bash" or p.child.argv0 == "fd-log-viewer") then
+                table.insert(viewers, {stream = stream, id = id, pid = pid, hue = tonumber(hue)})
+                if stream == args.stream then found = true end
+            elseif p and p.last_exit then
+                assert(rex.call("block.close", {session_id = rex.session_id, block_id = id}))
+            end
+        end
+    end
+    saved:close()
+end
+if not found then
+    local colors = {
+        err = {"#ffd4dc", "#2b171c"}, warn = {"#ffe2a8", "#292215"},
+        info = {"#c0f0d8", "#14261f"}, debug = {"#e3d2ff", "#221b30"},
+    }
+    local hue = ({err = 345, warn = 40, info = 150, debug = 270})[args.stream]
+    local color = colors[args.stream]
+    if not color then
+        -- Reserve the severity hues, then use the largest unused hue gap.
+        -- Remember choices so new streams don't reuse surviving viewers' colors.
+        local hues = {40, 150, 270, 345}
+        for _, viewer in ipairs(viewers) do table.insert(hues, viewer.hue) end
+        table.sort(hues)
+        local largest = -1
+        for i, start in ipairs(hues) do
+            local gap = (hues[i + 1] or hues[1] + 360) - start
+            if gap > largest then largest, hue = gap, (start + gap / 2) % 360 end
+        end
+        local function hsl(saturation, lightness)
+            local a = saturation * math.min(lightness, 1 - lightness)
+            local function channel(n)
+                local k = (n + hue / 30) % 12
+                return math.floor(255 * (lightness - a * math.max(-1, math.min(k - 3, 9 - k, 1))) + 0.5)
+            end
+            return string.format("#%02x%02x%02x", channel(0), channel(8), channel(4))
+        end
+        color = {hsl(0.45, 0.85), hsl(0.3, 0.11)}
+    end
+    local created = assert(rex.session.new_split {
+        anchor_id = #viewers == 0 and rex.block_id or viewers[#viewers].id,
+        direction = #viewers == 0 and "horizontal" or "vertical",
+        side = "after", ratio = 0.5, focus = false,
+        layout = {block = {
+            flavor = "com.superlogical.terminal.shell", label = "log:" .. args.stream,
+            options = {
+                shell = "none", login = false,
+                -- Program-set colors survive the Rex client's default theme.
+                command = {"bash", "-c",
+                    'printf "\\033]10;%s\\007\\033]11;%s\\007" "$1" "$2"; exec tail -n 20 -F -- "$3"',
+                    "fd-log-viewer", color[1], color[2], args.directory .. "/" .. args.stream .. ".log"},
+            },
+        }},
+    })
+    local id = created.block_ids[1]
+    local p = assert(process(id))
+    table.insert(viewers, {stream = args.stream, id = id, pid = assert(p.child).pid, hue = hue})
+end
+-- Appending at the bottom makes a right-leaning chain. Resize each remaining
+-- subtree to give its first viewer one equal share; never touch other panes.
+for i = 1, #viewers - 1 do
+    assert(rex.session.resize_pane {
+        before_block_id = viewers[i].id, after_block_id = viewers[i + 1].id,
+        direction = "vertical", ratio = 1 / (#viewers - i + 1),
+    })
+end
+local tmp = args.state .. ".tmp"
+local state = assert(io.open(tmp, "w"))
+for _, viewer in ipairs(viewers) do
+    assert(state:write(viewer.stream, "\t", viewer.id, "\t", viewer.pid, "\t", viewer.hue, "\n"))
+end
+assert(state:close())
+assert(os.rename(tmp, args.state))
+LUA
+fi

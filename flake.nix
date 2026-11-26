@@ -1,5 +1,5 @@
 {
-  description = "std.log routing to inherited per-level POSIX descriptors";
+  description = "Optional std.log collection over one inherited pipe";
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
 
   outputs = { self, nixpkgs }:
@@ -21,8 +21,44 @@
         };
 
       packages = forAllSystems (system:
-        let pkgs = pkgsFor system;
+        let
+          pkgs = pkgsFor system;
+          compiled = pkgs.stdenvNoCC.mkDerivation {
+            pname = "zig-fd-logging";
+            version = "0.1.0";
+            outputs = [ "out" "example" ];
+            src = pkgs.lib.fileset.toSource {
+              root = ./.;
+              fileset = pkgs.lib.fileset.unions [
+                ./build.zig ./build.zig.zon ./src ./python ./examples ./scripts ./tests
+                ./README.md ./flake.nix ./flake.lock
+              ];
+            };
+            nativeBuildInputs = with pkgs; [ zig python3 bash zsh fish nushell ];
+            postPatch = "patchShebangs scripts";
+            buildPhase = ''
+              export ZIG_GLOBAL_CACHE_DIR="$TMPDIR/zig-cache"
+              zig build -Doptimize=ReleaseSafe --prefix "$out"
+            '';
+            doCheck = true;
+            checkPhase = "zig build test";
+            installPhase = ''
+              mkdir -p "$example/bin"
+              mv "$out/bin/fd-log-example" "$example/bin/"
+              install -Dm644 README.md "$out/share/doc/zig-fd-logging/README.md"
+            '';
+          };
         in {
+          collector = compiled;
+          example = compiled.example;
+          python = pkgs.python3Packages.buildPythonPackage {
+            pname = "zig-fd-logging";
+            version = "0.1.0";
+            src = ./python;
+            pyproject = true;
+            build-system = [ pkgs.python3Packages.setuptools ];
+            pythonImportsCheck = [ "zig_fd_logging" ];
+          };
           default = pkgs.symlinkJoin {
             name = "zig-fd-logging";
             paths = with self.packages.${system}; [ example helpers ];
@@ -37,42 +73,32 @@
             nativeBuildInputs = [ pkgs.makeWrapper ];
             dontBuild = true;
             installPhase = ''
-              install -Dm755 scripts/fd-log-run "$out/bin/fd-log-run"
               install -Dm755 scripts/fd-log-panes "$out/bin/fd-log-panes"
+              install -Dm755 scripts/fd-log-view "$out/bin/fd-log-view"
+              ln -s ${compiled}/bin/fd-log-run "$out/bin/fd-log-run"
               patchShebangs "$out/bin"
-              wrapProgram "$out/bin/fd-log-run" --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.coreutils ]}
-              wrapProgram "$out/bin/fd-log-panes" --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.coreutils pkgs.bash pkgs.tmux ]}
+              for helper in fd-log-panes fd-log-view; do
+                wrapProgram "$out/bin/$helper" --suffix PATH : ${pkgs.lib.makeBinPath [ compiled pkgs.coreutils pkgs.bash pkgs.tmux ]}
+              done
               mkdir -p "$out/share/fd-log"
               cp examples/shell/config.* "$out/share/fd-log/"
             '';
           };
-          example = pkgs.stdenvNoCC.mkDerivation {
-            pname = "zig-fd-logging-example";
-            version = "0.1.0";
-            src = pkgs.lib.fileset.toSource {
-              root = ./.;
-              fileset = pkgs.lib.fileset.unions [
-                ./build.zig ./build.zig.zon ./src ./examples ./scripts ./tests
-                ./README.md ./flake.nix ./flake.lock
-              ];
-            };
-            nativeBuildInputs = with pkgs; [ zig python3 bash zsh fish nushell ];
-            postPatch = "patchShebangs scripts";
-            buildPhase = ''
-              export ZIG_GLOBAL_CACHE_DIR="$TMPDIR/zig-cache"
-              zig build --prefix "$out"
-            '';
-            doCheck = true;
-            checkPhase = "zig build test";
-            installPhase = ''
-              install -Dm644 README.md "$out/share/doc/zig-fd-logging/README.md"
-            '';
-          };
         });
-      checks = forAllSystems (system: {
-        integration = self.packages.${system}.example;
-        helpers = self.packages.${system}.helpers;
-      });
+      checks = forAllSystems (system:
+        let pkgs = pkgsFor system;
+        in {
+          integration = self.packages.${system}.collector;
+          helpers = self.packages.${system}.helpers;
+          python = self.packages.${system}.python;
+          shellcheck = pkgs.runCommand "fd-log-shellcheck" {
+            nativeBuildInputs = [ pkgs.shellcheck ];
+          } ''
+            shellcheck ${./scripts/fd-log-panes} ${./scripts/fd-log-view}
+            shellcheck -s bash ${./examples/shell/config.sh}
+            touch "$out"
+          '';
+        });
       devShells = forAllSystems (system:
         let pkgs = pkgsFor system;
         in {

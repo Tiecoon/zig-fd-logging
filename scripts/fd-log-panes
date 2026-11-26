@@ -7,8 +7,11 @@ fi
 backend=$1
 directory=$2
 shift 3
-command -v "$backend" >/dev/null
-if [[ $backend == tmux && -z ${TMUX:-} ]]; then
+if ! command -v "$backend" >/dev/null 2>&1; then
+    printf '%s is not installed or not on PATH.\n' "$backend" >&2
+    exit 2
+fi
+if [[ $backend == tmux && ( -z ${TMUX:-} || -z ${TMUX_PANE:-} ) ]]; then
     printf 'Run the tmux helper inside a tmux session.\n' >&2
     exit 2
 fi
@@ -18,21 +21,22 @@ if [[ $backend == rex && -z ${REX_BLOCK:-} ]]; then
 fi
 mkdir -p -- "$directory"
 directory=$(cd -- "$directory" && pwd -P)
-for level in err warn info debug; do
-    touch -- "$directory/$level.log"
-    if [[ $backend == tmux ]]; then
-        # tmux takes a shell command, so quote every argument for a known shell.
-        printf -v watch '%q ' tail -n 20 -F -- "$directory/$level.log"
-        printf -v pane_command 'bash -c %q' "exec $watch"
-        tmux split-window -d -v "$pane_command"
-        tmux select-layout tiled >/dev/null
-    else
-        rex split -b "$REX_BLOCK" --split=below --ratio 20 --focus=false \
-            --label "log:$level" --shell=none -- \
-            tail -n 20 -F -- "$directory/$level.log" >/dev/null
+if [[ $backend == tmux ]]; then
+    caller=$(tmux display-message -p -t "$TMUX_PANE" '#{pane_id}')
+    if [[ $caller != "$TMUX_PANE" ]]; then
+        printf 'The calling tmux pane no longer exists.\n' >&2
+        exit 2
     fi
-done
-# Logs are durable regular files, not FIFOs: closing a pane cannot SIGPIPE or
-# block the application. Tailers remain available until the user closes them.
+    server=$(tmux display-message -p -t "$caller" '#{pid}')
+    state="$directory/.fd-log-tmux-$server-${caller#%}"
+else
+    caller=$REX_BLOCK
+    rex 'do' -b "$caller" -e 'assert(rex.session.view {})' >/dev/null
+    state="$directory/.fd-log-rex-${caller#block:}"
+fi
+export FD_LOG_BACKEND=$backend FD_LOG_CALLER=$caller FD_LOG_STATE=$state
+# Discover streams as records arrive. Regular files let viewers outlive commands.
 script_directory=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
-exec "$script_directory/fd-log-run" "$directory" -- "$@"
+collector=fd-log-run
+[[ -x $script_directory/fd-log-run ]] && collector=$script_directory/fd-log-run
+exec "$collector" --on-stream "$script_directory/fd-log-view" "$directory" -- "$@"

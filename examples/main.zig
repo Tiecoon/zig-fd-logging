@@ -8,11 +8,8 @@ pub const std_options: std.Options = .{
 };
 
 pub fn main(init: std.process.Init) !void {
-    try fd_log.configureFromEnvironment(init.environ_map);
+    fd_log.configureFromEnvironment(init.environ_map);
     const args = try init.minimal.args.toSlice(init.arena.allocator());
-    if (args.len > 1 and std.mem.eql(u8, args[1], "--partial")) {
-        try fd_log.configure(.{ .warn = 4, .debug = 6 });
-    }
     try std.Io.File.stdout().writeStreamingAll(init.io, "stdout stays stdout\n");
     try std.Io.File.stderr().writeStreamingAll(init.io, "stderr stays stderr\n");
     std.log.err("error {d}", .{17});
@@ -22,6 +19,14 @@ pub fn main(init: std.process.Init) !void {
     std.log.scoped(.network).info("connected {d}", .{42});
     std.log.scoped(.quiet).info("must not appear", .{});
     std.log.scoped(.quiet).warn("visible", .{});
+    if (args.len > 1 and std.mem.eql(u8, args[1], "--scopes")) {
+        std.log.scoped(.network).err("disconnected", .{});
+        std.log.scoped(.database).info("transaction\ncommitted", .{});
+        std.log.scoped(.err).warn("a scope, not a level", .{});
+        std.log.scoped(.@"../name with 'quotes' $;\n").debug("safe filename", .{});
+        std.log.scoped(.@"日本語").info("unicode scope", .{});
+        std.log.scoped(.worker).info("working", .{});
+    }
     if (args.len > 1 and std.mem.eql(u8, args[1], "--concurrent")) {
         var group: std.Io.Group = .init;
         defer group.cancel(init.io);
