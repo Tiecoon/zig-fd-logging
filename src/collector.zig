@@ -28,6 +28,8 @@ fn run(init: std.process.Init) !u8 {
     }
     if (args.len < index + 3 or !std.mem.eql(u8, args[index + 1], "--")) return usage();
     const directory = args[index];
+    var stdio = try StdioState.reserve(io);
+    defer stdio.deinit(io);
     var dir = try std.Io.Dir.cwd().createDirPathOpen(io, directory, .{});
     defer dir.close(io);
 
@@ -36,13 +38,7 @@ fn run(init: std.process.Init) !u8 {
     var write: ?File = .{ .handle = fds[1], .flags = .{ .nonblocking = false } };
     defer if (read) |f| f.close(io);
     defer if (write) |f| f.close(io);
-    // Keep the transport separate even when standard descriptors are closed.
-    if (write.?.handle <= 2) {
-        const fd = std.posix.system.fcntl(write.?.handle, std.posix.F.DUPFD_CLOEXEC, @as(usize, 3));
-        if (std.posix.errno(fd) != .SUCCESS) return error.DuplicateFailed;
-        write.?.close(io);
-        write.?.handle = @intCast(fd);
-    }
+    std.debug.assert(write.?.handle > 2);
     var env = try init.environ_map.clone(gpa);
     defer env.deinit();
     const value = try std.fmt.allocPrint(gpa, "{d}", .{write.?.handle});
@@ -51,6 +47,9 @@ fn run(init: std.process.Init) !u8 {
     var child = try std.process.spawn(io, .{
         .argv = args[index + 2 ..],
         .environ_map = &env,
+        .stdin = stdio.childStdio(0),
+        .stdout = stdio.childStdio(1),
+        .stderr = stdio.childStdio(2),
         .inherit_files = &.{write.?},
     });
     write.?.close(io);
@@ -63,7 +62,7 @@ fn run(init: std.process.Init) !u8 {
 
     // A failed collector closes its pipe so subsequent app logs fall back to
     // stderr. Still wait for the app; collection errors must not kill it.
-    const result = collect(io, gpa, read.?, dir, directory, hook);
+    const result = collect(io, gpa, read.?, dir, directory, hook, stdio.childStdio(2));
     read.?.close(io);
     read = null;
     const term = try child.wait(io);
@@ -102,12 +101,74 @@ fn forwardTerm(_: std.posix.SIG) callconv(.c) void {
     if (pid > 0) std.posix.kill(pid, .TERM) catch {};
 }
 
+const StdioState = struct {
+    open: [3]bool = .{ false, false, false },
+    placeholders: [3]?File = .{ null, null, null },
+
+    fn reserve(io: std.Io) !StdioState {
+        var state: StdioState = .{};
+        errdefer state.deinit(io);
+        for (0..3) |i| {
+            const fd: std.posix.fd_t = @intCast(i);
+            if (std.posix.errno(std.posix.system.fcntl(fd, std.posix.F.GETFD, @as(u32, 0))) == .SUCCESS) {
+                state.open[i] = true;
+            }
+        }
+        // Keep closed standard descriptors occupied with CLOEXEC /dev/null so
+        // collector fds never land on 0..2 and std.process.spawn(.close) works on
+        // both POSIX (closeFd) and Darwin (posix_spawn_file_actions_addclose).
+        for (0..3) |i| {
+            if (state.open[i]) continue;
+            const target: std.posix.fd_t = @intCast(i);
+            const file = try std.Io.Dir.openFileAbsolute(io, "/dev/null", .{ .mode = .read_only });
+            if (file.handle == target) {
+                state.placeholders[i] = file;
+            } else {
+                defer file.close(io);
+                while (true) switch (std.posix.errno(std.posix.system.dup2(file.handle, target))) {
+                    .SUCCESS => break,
+                    .INTR => continue,
+                    else => return error.DuplicateFailed,
+                };
+                const placed: File = .{ .handle = target, .flags = .{ .nonblocking = false } };
+                if (std.posix.errno(std.posix.system.fcntl(target, std.posix.F.SETFD, @as(u32, std.posix.FD_CLOEXEC))) != .SUCCESS) {
+                    placed.close(io);
+                    return error.DuplicateFailed;
+                }
+                state.placeholders[i] = placed;
+            }
+        }
+        return state;
+    }
+
+    fn deinit(state: *StdioState, io: std.Io) void {
+        for (&state.placeholders) |*maybe_file| {
+            if (maybe_file.*) |file| {
+                file.close(io);
+                maybe_file.* = null;
+            }
+        }
+    }
+
+    fn childStdio(state: StdioState, fd: usize) std.process.SpawnOptions.StdIo {
+        return if (state.open[fd]) .inherit else .close;
+    }
+};
+
 const ScopeState = struct {
     file: ?File = null,
     used: u64 = 0,
 };
 
-fn collect(io: std.Io, gpa: std.mem.Allocator, pipe: File, dir: std.Io.Dir, directory: []const u8, hook: ?[]const u8) !void {
+fn collect(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    pipe: File,
+    dir: std.Io.Dir,
+    directory: []const u8,
+    hook: ?[]const u8,
+    stderr_behavior: std.process.SpawnOptions.StdIo,
+) !void {
     var level_files: [4]?File = .{ null, null, null, null };
     defer for (level_files) |maybe_file| if (maybe_file) |f| f.close(io);
 
@@ -195,6 +256,7 @@ fn collect(io: std.Io, gpa: std.mem.Allocator, pipe: File, dir: std.Io.Dir, dire
                     .argv = &.{ program, directory, discovered_name },
                     .stdin = .ignore,
                     .stdout = .ignore,
+                    .stderr = stderr_behavior,
                 });
                 if (!(try viewer.wait(io)).success()) return error.ViewerFailed;
             }

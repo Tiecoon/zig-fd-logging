@@ -178,17 +178,34 @@ class PythonClient(unittest.TestCase):
         self.assertEqual(self.read_logs(), {'info.log': 'INFO:root:before close\n'})
 
     def test_collection_with_closed_standard_descriptors(self):
-        result = subprocess.run([
-            'bash', '-c', 'exec "$@" 0<&- 1>&- 2>&-', 'closed-stdio',
-            COLLECTOR, str(self.logs), '--', sys.executable, '-c',
-            "import logging; from zig_fd_logging import Handler; "
-            "logging.basicConfig(handlers=[Handler()], level=logging.INFO); "
-            "logging.info('collected without standard streams')",
-        ], env=self.env, capture_output=True, timeout=30)
-        self.assertEqual(result.returncode, 0)
-        self.assertEqual(self.read_logs(), {
-            'info.log': 'INFO:root:collected without standard streams\n',
-        })
+        for redir, closed_fds in (
+            ('0<&- 1>&- 2>&-', (0, 1, 2)),
+            ('2>&-', (2,)),
+            ('0<&- 1>&-', (0, 1)),
+        ):
+            with self.subTest(redir=redir):
+                logs = self.directory / f"closed {len(closed_fds)} {closed_fds[0]}"
+                code = (
+                    "import errno, logging, os\n"
+                    "from zig_fd_logging import Handler\n"
+                    f"for fd in {closed_fds!r}:\n"
+                    "    try:\n"
+                    "        os.fstat(fd)\n"
+                    "    except OSError as exc:\n"
+                    "        assert exc.errno == errno.EBADF\n"
+                    "    else:\n"
+                    "        raise AssertionError(f'fd {fd} unexpectedly open')\n"
+                    "logging.basicConfig(handlers=[Handler()], level=logging.INFO)\n"
+                    "logging.info('collected without standard streams')\n"
+                )
+                result = subprocess.run([
+                    'bash', '-c', f'exec "$@" {redir}', 'closed-stdio',
+                    COLLECTOR, str(logs), '--', sys.executable, '-c', code,
+                ], env=self.env, capture_output=True, timeout=30)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual({p.name: p.read_text() for p in logs.glob("*.log")}, {
+                    'info.log': 'INFO:root:collected without standard streams\n',
+                })
 
     def test_broken_pipe_retries_and_stays_on_standard_stream(self):
         read, write = os.pipe()
@@ -211,10 +228,13 @@ class PythonClient(unittest.TestCase):
             logging.basicConfig(handlers=[Handler()], level=logging.INFO)
             logging.info('triggers collector failure')
             fd = int(os.environ['ZIG_LOG_FD'])
-            import select
+            import select, time
             poll = select.poll()
-            poll.register(fd, select.POLLERR)
-            assert poll.poll(5000), 'collector did not disconnect'
+            poll.register(fd, select.POLLOUT)
+            deadline = time.monotonic() + 5.0
+            while not any(ev & (select.POLLERR | select.POLLHUP) for _, ev in poll.poll(0)):
+                assert time.monotonic() < deadline, 'collector did not disconnect'
+                time.sleep(0.01)
             logging.warning('fallback after collector failure')
             logging.error('still on stderr')
         """, True)
